@@ -1,12 +1,19 @@
-Powai Change Observatory — local analysis service
+POWAI CHANGE OBSERVATORY — ANALYSIS SERVICE
 
-Supported comparison years in the website: 2014 through 2026.
-Satellite choices: Landsat Collection 2 Level-2 (2014–2024) and Sentinel-2 L2A (2015 onward through 2026). Sentinel-2 is not available for 2014; the service returns a clear availability message. Some year/month/cloud combinations may also have no suitable scene; the service reports that rather than using another date silently.
+Auto-generated mode searches Microsoft Planetary Computer, signs public image assets, applies sensor cloud masks, clips to the supplied Powai boundary, and returns satellite, index, binary, change maps and area charts.
 
-The service searches Microsoft Planetary Computer, signs public asset URLs, applies QA cloud masking, clips to the supplied Powai boundary, calculates water (MNDWI > 0) or built-up (ENDISI > 0), and returns scene previews and pixel-area estimates. Results are scene-specific threshold estimates; include scene dates, sensor, month, cloud limit, and method in reports.
+Use your own layers mode accepts one single-band GeoTIFF per band prompt, for both the earlier and later years. Files must have georeferencing and a CRS. Use rasters clipped to the Powai study area, projected in metres (EPSG:32643 recommended), and consistently scaled for their sensor/date. Uploaded layers are aligned to the earlier Green band. Custom uploads are not automatically cloud-masked; use clear-sky imagery or a pre-masked raster.
 
-Run from this folder in the activated conda environment:
+Water (NDWI): upload Green and NIR for each date.
+- Sentinel-2: B03 Green and B08 NIR.
+- Landsat 8/9: B3 Green and B5 NIR.
+
+Built-up (ENDISI): upload Blue, Green, Red, NIR, SWIR-1, and SWIR-2 for each date.
+- Sentinel-2: B02, B03, B04, B08, B11, and B12.
+- Landsat 8/9: B2, B3, B4, B5, B6, and B7.
+ENDISI uses Blue, Green, SWIR-1, and SWIR-2; NIR is used for water exclusion and Red/Green/Blue supply the preview.
+
+A single-band GeoTIFF file is required for each prompt. Do not upload a multi-band stack in one input. Files are limited to 25 MB each and 120 MB per analysis upload. The years entered are labels for the uploaded dates; they do not change the images.
+
+Run locally in the activated conda environment:
   python -m uvicorn app:app --host 127.0.0.1 --port 8000
-
-The service returns a coded change map: 1 = water-to-non-water, 10 = non-water-to-water, 11 = water in both dates, 0 = non-water in both dates. Light gray marks cloud-masked or out-of-AOI pixels. The selected class follows the active Water/Built-up tab.
-

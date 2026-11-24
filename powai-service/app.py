@@ -7,10 +7,11 @@ import rasterio
 from rasterio.mask import mask
 from rasterio.warp import transform_geom, reproject, Resampling
 from rasterio.features import geometry_mask
-from rasterio.windows import from_bounds
+from rasterio.windows import from_bounds, Window
+from rasterio.io import MemoryFile
 from pystac_client import Client
 import planetary_computer
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -132,6 +133,7 @@ def display_rgb(rgb,mask_arr=None,kind="water",inside=None):
         out[edge]=[255,235,0]
     return out
 def render_index(index,valid,inside):
+    index=np.where(valid,index,0)
     v=np.clip((index+1)/2,0,1)
     img=np.stack([255*v,255*(1-np.abs(2*v-1)),255*(1-v)],axis=-1).astype("uint8")
     img[~valid]=[220,220,220]
@@ -154,7 +156,7 @@ def study_area():
     if not AREA.exists(): raise HTTPException(404,"Study boundary file is missing")
     return gpd.read_file(AREA).to_crs(4326).__geo_interface__
 @app.get("/api/health")
-def health(): return {"status":"ok","study_area":AREA.exists(),"collection":"landsat-c2-l2 / sentinel-2-l2a","change_area_schema":"target-change-areas-v1","change_area_fields":["unchanged","reduced","increased"]}
+def health(): return {"status":"ok","study_area":AREA.exists(),"collection":"landsat-c2-l2 / sentinel-2-l2a","change_area_schema":"target-change-areas-v1","change_area_fields":["unchanged","reduced","increased"],"custom_layer_schema":"single-band-geotiff-v1"}
 @app.post("/api/analyze")
 def analyze(req:AnalysisRequest):
     if req.start_year>=req.end_year: raise HTTPException(400,"End year must be later than start year")
@@ -185,6 +187,113 @@ def analyze(req:AnalysisRequest):
         legend=("0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray cloud/no-data" if req.analysis=="water" else "0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray cloud/no-data")
         return {"analysis":req.analysis,"metric":"water_area_km2" if req.analysis=="water" else "builtup_area_km2","earlier":{"year":req.start_year,"area_km2":round(av,4),"date":ad,"scene":aid,"cloud":acl},"later":{"year":req.end_year,"area_km2":round(bv,4),"date":bd,"scene":bid,"cloud":bcl},"change_km2":round(change,4),"change_percent":round(change/av*100,2) if av else None,"warnings":warnings,"change_legend":legend,"binary_stats":binary_stats,"change_stats":change_stats,"change_areas_km2":change_areas,"change_preview":png64(change_image),"previews":{"earlier":png64(display_rgb(ar,None,req.analysis,ai)),"later":png64(display_rgb(br,None,req.analysis,bi)),"index_earlier":render_index(ix_a,ac,ai),"index_later":render_index(ix_b,bc,bi),"binary_earlier":render_binary(am,ac,ai,req.analysis),"binary_later":render_binary(bm,bc,bi,req.analysis)},"method":("Sentinel-2 L2A tile 43QBB, 10 m for water/20 m built-up" if req.satellite=="sentinel" else "Landsat Collection 2 Level-2 30 m")+" surface reflectance; cloud/shadow/snow masked; NDWI > 0 for water; Sentinel SCL water class included; ENDISI > "+str(req.builtup_threshold)+" for built-up; pixels clipped to Powai boundary."}
     except Exception as e: raise HTTPException(502,str(e))
+
+def _read_reference_grid(content,geom):
+    with MemoryFile(content) as mem:
+        with mem.open() as src:
+            if src.count!=1: raise ValueError("Upload one single-band GeoTIFF per band prompt; multi-band stacks are not accepted here.")
+            if src.crs is None or not src.crs.is_projected: raise ValueError("The earlier Green band must use a projected CRS in metres. Reproject the input bands to UTM Zone 43N (EPSG:32643) before uploading.")
+            projected_geom=shape(transform_geom("EPSG:4326",src.crs,geom))
+            window=from_bounds(*projected_geom.bounds,transform=src.transform).round_offsets().round_lengths()
+            window=window.intersection(Window(0,0,src.width,src.height)).round_offsets().round_lengths()
+            if window.width<1 or window.height<1: raise ValueError("The earlier Green band does not cover the Powai study area.")
+            transform=src.window_transform(window); data=src.read(1,window=window).astype("float32")
+            data[src.read_masks(1,window=window)==0]=np.nan
+            factor=src.crs.axis_info[0].unit_conversion_factor or 1.0
+            pixel_km2=abs(transform.a*transform.e-transform.b*transform.d)*(factor**2)/1e6
+            return data,transform,src.crs,projected_geom,pixel_km2
+
+def _warp_uploaded_band(content,out_shape,out_transform,out_crs):
+    with MemoryFile(content) as mem:
+        with mem.open() as src:
+            if src.count!=1: raise ValueError("Upload one single-band GeoTIFF per band prompt; multi-band stacks are not accepted here.")
+            if src.crs is None: raise ValueError("An uploaded band has no coordinate reference system. Export it with its CRS attached.")
+            source=src.read(1).astype("float32")
+            source[src.read_masks(1)==0]=np.nan
+            destination=np.full(out_shape,np.nan,dtype="float32")
+            reproject(source=source,destination=destination,src_transform=src.transform,src_crs=src.crs,src_nodata=np.nan,dst_transform=out_transform,dst_crs=out_crs,dst_nodata=np.nan,resampling=Resampling.bilinear)
+            return destination
+
+def _classify_uploaded(arrays,kind,threshold,inside):
+    valid=inside.copy()
+    for array in arrays.values(): valid &= np.isfinite(array)
+    eps=1e-8; green=arrays["green"]
+    if kind=="water":
+        index=(green-arrays["nir"])/(green+arrays["nir"]+eps)
+        chosen=binary_opening((index>0)&valid,disk(1))
+        rgb=np.stack([arrays["nir"],green,green],axis=-1)
+        preview_note="NIR/Green/Green false-colour preview; NDWI = (Green − NIR) / (Green + NIR); water where NDWI > 0."
+    else:
+        swir1=arrays["swir1"]; swir2=arrays["swir2"]; blue=arrays["blue"]
+        water_index=(green-arrays["nir"])/(green+arrays["nir"]+eps)
+        water=binary_opening((water_index>0)&valid,disk(1))
+        land=valid&~water
+        mndwi=(green-swir1)/(green+swir1+eps)
+        ratio=np.clip(swir1/(swir2+eps),0,5)
+        alpha=(2*np.nanmean(blue[land]))/(np.nanmean(ratio[land])+np.nanmean(mndwi[land]**2)+eps) if land.any() else 0.0
+        term=alpha*(ratio+mndwi**2)
+        index=(blue-term)/(blue+term+eps)
+        chosen=(index>threshold)&valid&~water
+        rgb=np.stack([arrays["red"],green,blue],axis=-1)
+        preview_note=f"ENDISI built-up index > {threshold}; water excluded with NDWI > 0."
+    area=float(chosen.sum())
+    return area,chosen,valid,rgb,np.where(valid,index,np.nan),preview_note
+
+@app.post("/api/analyze/upload")
+async def analyze_uploaded(request:Request):
+    try:
+        form=await request.form(max_files=20,max_fields=30)
+        kind=str(form.get("analysis","water")); satellite=str(form.get("satellite","sentinel"))
+        if kind not in ("water","built"): raise ValueError("Choose Water changes or Built-up changes before uploading bands.")
+        if satellite not in ("sentinel","landsat"): raise ValueError("Choose Sentinel-2 or Landsat for the band mapping.")
+        start_year=int(form.get("start_year",2017)); end_year=int(form.get("end_year",2026)); threshold=float(form.get("builtup_threshold",-0.32))
+        if start_year>=end_year: raise ValueError("The later year must be after the earlier year.")
+        if not -1<=threshold<=1: raise ValueError("ENDISI threshold must be between -1 and 1.")
+        roles=["green","nir"] if kind=="water" else ["blue","green","red","nir","swir1","swir2"]
+        payloads={}; total=0
+        for date_key in ("earlier","later"):
+            for role in roles:
+                name=f"{date_key}_{role}"; upload=form.get(name)
+                if upload is None or not hasattr(upload,"read") or not upload.filename: raise ValueError(f"Select a GeoTIFF for {date_key} {role.upper()}.")
+                data=await upload.read(); total+=len(data)
+                if len(data)>25*1024*1024: raise ValueError(f"{name} is larger than 25 MB. Clip/export the band to the Powai study area and try again.")
+                payloads[name]=data
+        if total>120*1024*1024: raise ValueError("The upload set is larger than 120 MB. Clip every band to the Powai study area before uploading.")
+        gdf=gpd.read_file(AREA)
+        if gdf.crs is None: raise ValueError("The Powai boundary file has no coordinate reference system.")
+        geom=gdf.to_crs(4326).geometry.union_all().__geo_interface__
+        ref,transform,crs,projected_geom,pixel_km2=_read_reference_grid(payloads["earlier_green"],geom)
+        inside=geometry_mask([projected_geom],out_shape=ref.shape,transform=transform,invert=True)
+        grid_shape=ref.shape
+        dates=[]
+        for date_key in ("earlier","later"):
+            arrays={}
+            for role in roles:
+                name=f"{date_key}_{role}"
+                if date_key=="earlier" and role=="green": arrays[role]=ref
+                else: arrays[role]=_warp_uploaded_band(payloads[name],grid_shape,transform,crs)
+            area,mask_arr,valid,rgb,index,preview_note=_classify_uploaded(arrays,kind,threshold,inside)
+            if not valid.any(): raise ValueError(f"The uploaded {date_key} bands contain no valid pixels inside the Powai boundary. Check AOI coverage, nodata, and CRS.")
+            year=start_year if date_key=="earlier" else end_year
+            dates.append({"area":area*pixel_km2,"mask":mask_arr,"valid":valid,"rgb":rgb,"index":index,"year":year,"date":None,"scene":"User-uploaded bands"})
+        before,after=dates
+        valid_both=before["valid"]&after["valid"]&inside
+        change_codes=np.where(valid_both,before["mask"].astype("uint8")+10*after["mask"].astype("uint8"),255).astype("uint8")
+        change_image=np.full((*change_codes.shape,3),[220,220,220],dtype="uint8")
+        change_image[change_codes==0]=[232,236,233]; change_image[change_codes==1]=[235,74,86]
+        change_image[change_codes==10]=[45,150,235]; change_image[change_codes==11]=[45,185,115]
+        denominator=max(int(valid_both.sum()),1)
+        change_stats={str(code):round(float(np.sum(change_codes[valid_both]==code)/denominator*100),2) for code in [0,1,10,11]}
+        change_areas={"unchanged":round(float(np.sum(valid_both&(change_codes==11))*pixel_km2),4),"reduced":round(float(np.sum(valid_both&(change_codes==1))*pixel_km2),4),"increased":round(float(np.sum(valid_both&(change_codes==10))*pixel_km2),4)}
+        earlier_area=round(before["area"],4); later_area=round(after["area"],4); change=later_area-earlier_area
+        binary_stats={"earlier_pct":round(float(before["mask"][before["valid"]].mean()*100),2),"later_pct":round(float(after["mask"][after["valid"]].mean()*100),2)}
+        def scene_preview(entry):
+            clean=np.where(np.isfinite(entry["rgb"]),entry["rgb"],np.nan)
+            return png64(display_rgb(clean,None,kind,inside))
+        method=f"User-uploaded {satellite.title()} single-band GeoTIFFs; {preview_note} Cloud masking is not automatic for custom bands; nodata and Powai AOI masked. All date bands resampled to the earlier Green grid."
+        return {"analysis":kind,"metric":"water_area_km2" if kind=="water" else "builtup_area_km2","earlier":{"year":start_year,"area_km2":earlier_area,"date":None,"scene":"User-uploaded bands","cloud":None},"later":{"year":end_year,"area_km2":later_area,"date":None,"scene":"User-uploaded bands","cloud":None},"change_km2":round(change,4),"change_percent":round(change/earlier_area*100,2) if earlier_area else None,"warnings":["Custom uploaded bands are not automatically cloud-masked. Use clear-sky, consistently processed bands."],"change_legend":"0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray nodata","binary_stats":binary_stats,"change_stats":change_stats,"change_areas_km2":change_areas,"change_preview":png64(change_image),"previews":{"earlier":scene_preview(before),"later":scene_preview(after),"index_earlier":render_index(before["index"],before["valid"],inside),"index_later":render_index(after["index"],after["valid"],inside),"binary_earlier":render_binary(before["mask"],before["valid"],inside,kind),"binary_later":render_binary(after["mask"],after["valid"],inside,kind)},"method":method}
+    except Exception as e:
+        raise HTTPException(400,str(e))
 
 
 
