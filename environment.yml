@@ -1,0 +1,17 @@
+name: powai
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - fastapi
+  - uvicorn
+  - geopandas
+  - rasterio
+  - numpy
+  - scikit-image
+  - pystac-client
+  - pillow
+  - shapely
+  - pip
+  - pip:
+      - planetary-computer

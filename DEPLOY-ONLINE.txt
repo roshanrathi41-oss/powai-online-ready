@@ -1,0 +1,12 @@
+Online deployment notes
+
+The web page and analysis API are served from one Render web service. The page uses the same-origin API when deployed, and continues using localhost when opened locally as a file.
+
+Deploy overview:
+1. Create a private GitHub repository and add the contents of this folder at the repository root: Dockerfile, environment.yml, render.yaml, index.html, and powai-service/ (including study-area shapefile files).
+2. In Render, create a new Blueprint and connect that repository. Review the service settings from render.yaml and deploy.
+3. After deployment, open the public .onrender.com address. The root address serves the website; /api/health reports service health.
+
+The Blueprint selects Render's free plan. Free Render web services sleep after 15 minutes without requests and can take time to wake up. The Landsat/Sentinel image processing may also hit resource or request-time limits on the free plan. The AOI boundary files must be included in the repository. For dependable public access, choose a paid plan after checking current hosting costs and resource limits.
+
+Do not commit personal credentials or tokens. No AWS credentials are needed; Planetary Computer signs public imagery URLs through the SDK.
