@@ -25,17 +25,18 @@ CATALOG="https://planetarycomputer.microsoft.com/api/stac/v1"
 SENTINEL_TILE="43QBB"
 class AnalysisRequest(BaseModel):
     analysis:str="water"
-    start_year:int=Field(ge=2014,le=2026)
-    end_year:int=Field(ge=2014,le=2026)
-    month:int=Field(default=5,ge=1,le=12)
+    start_year:int=Field(default=2017,ge=2014,le=2026)
+    end_year:int=Field(default=2026,ge=2014,le=2026)
+    month:int=Field(default=3,ge=1,le=12)
     cloud:float=Field(default=30,ge=0,le=100)
-    satellite:str="landsat"
+    satellite:str="sentinel"
     builtup_threshold:float=Field(default=-0.32,ge=-1,le=1)
 
 def find_scene(year,month,cloud,geom,satellite):
-    if satellite=="sentinel" and year<2015:
-        raise ValueError(f"Sentinel-2 data is not available for {year}. Select Landsat for {year}, or choose a year from 2015 to 2026 for Sentinel-2.")
+    if satellite=="sentinel" and (year<2015 or (year==2015 and month<6)):
+        raise ValueError("Sentinel-2 cannot provide earlier imagery: Sentinel-2A launched on 23 June 2015 and its first image was acquired on 27 June 2015. The imagery archive begins in June 2015; choose June 2015 or later. A usable scene over Powai may begin later depending on the satellite orbit, coverage, and cloud conditions. Choose Landsat for earlier dates.")
     first=f"{year}-{month:02d}-01"; last=f"{year}-{month:02d}-{calendar.monthrange(year,month)[1]}"
+    if satellite=="sentinel" and year==2015 and month==6: first="2015-06-27"
     collection="sentinel-2-l2a" if satellite=="sentinel" else "landsat-c2-l2"
     items=list(Client.open(CATALOG,modifier=planetary_computer.sign_inplace).search(collections=[collection],intersects=geom,datetime=f"{first}/{last}",query={"eo:cloud_cover":{"lt":cloud}},limit=100).items())
     if satellite=="sentinel":
@@ -110,7 +111,7 @@ def analyze_scene(item,geom,kind,satellite,builtup_threshold=-0.32):
     index=ndwi if kind=="water" else endisi
     area=float(chosen.sum()*resolution*resolution/1e6)
     rgb=np.stack([bands["red"],bands["green"],bands["blue"]],axis=-1)
-    return area,chosen,clear,rgb,inside,index,transform,item.properties.get("datetime"),item.id,float(item.properties.get("eo:cloud_cover",0))
+    return area,chosen,clear,rgb,inside,index,resolution,transform,item.properties.get("datetime"),item.id,float(item.properties.get("eo:cloud_cover",0))
 def png64(image):
     out=io.BytesIO(); Image.fromarray(image.astype("uint8")).save(out,format="PNG"); return "data:image/png;base64,"+base64.b64encode(out.getvalue()).decode()
 def display_rgb(rgb,mask_arr=None,kind="water",inside=None):
@@ -148,8 +149,12 @@ def home():
     page=Path(__file__).resolve().parent.parent/"index.html"
     if not page.exists(): raise HTTPException(404,"Website file index.html is missing")
     return FileResponse(page)
+@app.get("/api/study-area")
+def study_area():
+    if not AREA.exists(): raise HTTPException(404,"Study boundary file is missing")
+    return gpd.read_file(AREA).to_crs(4326).__geo_interface__
 @app.get("/api/health")
-def health(): return {"status":"ok","study_area":AREA.exists(),"collection":"landsat-c2-l2"}
+def health(): return {"status":"ok","study_area":AREA.exists(),"collection":"landsat-c2-l2 / sentinel-2-l2a","change_area_schema":"target-change-areas-v1","change_area_fields":["unchanged","reduced","increased"]}
 @app.post("/api/analyze")
 def analyze(req:AnalysisRequest):
     if req.start_year>=req.end_year: raise HTTPException(400,"End year must be later than start year")
@@ -159,8 +164,8 @@ def analyze(req:AnalysisRequest):
         geom=gdf.to_crs(4326).geometry.union_all().__geo_interface__
         if req.satellite not in ("landsat","sentinel"): raise ValueError("Choose Landsat or Sentinel-2.")
         a=find_scene(req.start_year,req.month,req.cloud,geom,req.satellite); b=find_scene(req.end_year,req.month,req.cloud,geom,req.satellite)
-        av,am,ac,ar,ai,ix_a,_,ad,aid,acl=analyze_scene(a,geom,req.analysis,req.satellite,req.builtup_threshold)
-        bv,bm,bc,br,bi,ix_b,_,bd,bid,bcl=analyze_scene(b,geom,req.analysis,req.satellite,req.builtup_threshold)
+        av,am,ac,ar,ai,ix_a,res_a,_,ad,aid,acl=analyze_scene(a,geom,req.analysis,req.satellite,req.builtup_threshold)
+        bv,bm,bc,br,bi,ix_b,res_b,_,bd,bid,bcl=analyze_scene(b,geom,req.analysis,req.satellite,req.builtup_threshold)
         warnings=[]
         if av<=0: warnings.append(f"No {req.analysis} pixels classified in {req.start_year}; inspect preview and try another date or threshold.")
         if bv<=0: warnings.append(f"No {req.analysis} pixels classified in {req.end_year}; inspect preview and try another date or threshold.")
@@ -168,16 +173,19 @@ def analyze(req:AnalysisRequest):
         valid_both=ac&bc&ai&bi
         change_codes=np.where(valid_both,am.astype("uint8")+10*bm.astype("uint8"),255).astype("uint8")
         change_image=np.full((*change_codes.shape,3),[220,220,220],dtype="uint8")
-        change_image[change_codes==0]=[45,55,65]
+        change_image[change_codes==0]=[232,236,233]
         change_image[change_codes==1]=[235,74,86]
         change_image[change_codes==10]=[45,150,235]
         change_image[change_codes==11]=[45,185,115]
         binary_stats={"earlier_pct":round(float(am[ac].mean()*100),2) if ac.any() else 0.0,"later_pct":round(float(bm[bc].mean()*100),2) if bc.any() else 0.0}
         denominator=max(int(valid_both.sum()),1)
         change_stats={str(code):round(float(np.sum(change_codes[valid_both]==code)/denominator*100),2) for code in [0,1,10,11]}
-        legend=("0 unchanged non-water · 1 water loss · 10 water gain · 11 water both dates · light gray cloud/no-data" if req.analysis=="water" else "0 unchanged non-built-up · 1 built-up loss · 10 built-up gain · 11 built-up in both dates")
-        return {"analysis":req.analysis,"metric":"water_area_km2" if req.analysis=="water" else "builtup_area_km2","earlier":{"year":req.start_year,"area_km2":round(av,4),"date":ad,"scene":aid,"cloud":acl},"later":{"year":req.end_year,"area_km2":round(bv,4),"date":bd,"scene":bid,"cloud":bcl},"change_km2":round(change,4),"change_percent":round(change/av*100,2) if av else None,"warnings":warnings,"change_legend":legend,"binary_stats":binary_stats,"change_stats":change_stats,"change_preview":png64(change_image),"previews":{"earlier":png64(display_rgb(ar,None,req.analysis,ai)),"later":png64(display_rgb(br,None,req.analysis,bi)),"index_earlier":render_index(ix_a,ac,ai),"index_later":render_index(ix_b,bc,bi),"binary_earlier":render_binary(am,ac,ai,req.analysis),"binary_later":render_binary(bm,bc,bi,req.analysis)},"method":("Sentinel-2 L2A tile 43QBB, 10 m for water/20 m built-up" if req.satellite=="sentinel" else "Landsat Collection 2 Level-2 30 m")+" surface reflectance; cloud/shadow/snow masked; NDWI > 0 for water; Sentinel SCL water class included; ENDISI > "+str(req.builtup_threshold)+" for built-up; pixels clipped to Powai boundary."}
+        pixel_km2=(res_a*res_a)/1e6
+        change_areas={"unchanged":round(float(np.sum(valid_both&(change_codes==11))*pixel_km2),4),"reduced":round(float(np.sum(valid_both&(change_codes==1))*pixel_km2),4),"increased":round(float(np.sum(valid_both&(change_codes==10))*pixel_km2),4)}
+        legend=("0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray cloud/no-data" if req.analysis=="water" else "0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray cloud/no-data")
+        return {"analysis":req.analysis,"metric":"water_area_km2" if req.analysis=="water" else "builtup_area_km2","earlier":{"year":req.start_year,"area_km2":round(av,4),"date":ad,"scene":aid,"cloud":acl},"later":{"year":req.end_year,"area_km2":round(bv,4),"date":bd,"scene":bid,"cloud":bcl},"change_km2":round(change,4),"change_percent":round(change/av*100,2) if av else None,"warnings":warnings,"change_legend":legend,"binary_stats":binary_stats,"change_stats":change_stats,"change_areas_km2":change_areas,"change_preview":png64(change_image),"previews":{"earlier":png64(display_rgb(ar,None,req.analysis,ai)),"later":png64(display_rgb(br,None,req.analysis,bi)),"index_earlier":render_index(ix_a,ac,ai),"index_later":render_index(ix_b,bc,bi),"binary_earlier":render_binary(am,ac,ai,req.analysis),"binary_later":render_binary(bm,bc,bi,req.analysis)},"method":("Sentinel-2 L2A tile 43QBB, 10 m for water/20 m built-up" if req.satellite=="sentinel" else "Landsat Collection 2 Level-2 30 m")+" surface reflectance; cloud/shadow/snow masked; NDWI > 0 for water; Sentinel SCL water class included; ENDISI > "+str(req.builtup_threshold)+" for built-up; pixels clipped to Powai boundary."}
     except Exception as e: raise HTTPException(502,str(e))
+
 
 
 
