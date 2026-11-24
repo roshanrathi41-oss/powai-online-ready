@@ -154,7 +154,7 @@ def study_area():
     if not AREA.exists(): raise HTTPException(404,"Study boundary file is missing")
     return gpd.read_file(AREA).to_crs(4326).__geo_interface__
 @app.get("/api/health")
-def health(): return {"status":"ok","study_area":AREA.exists(),"collection":"landsat-c2-l2 / sentinel-2-l2a"}
+def health(): return {"status":"ok","study_area":AREA.exists(),"collection":"landsat-c2-l2 / sentinel-2-l2a","change_area_schema":"target-change-areas-v1","change_area_fields":["unchanged","reduced","increased"]}
 @app.post("/api/analyze")
 def analyze(req:AnalysisRequest):
     if req.start_year>=req.end_year: raise HTTPException(400,"End year must be later than start year")
