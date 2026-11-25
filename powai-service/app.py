@@ -1,14 +1,14 @@
 from datetime import date
 from pathlib import Path
-import calendar, base64, io
+import calendar, base64, io, tempfile
 import numpy as np
 import geopandas as gpd
 import rasterio
+from pyproj import CRS as PyprojCRS
 from rasterio.mask import mask
 from rasterio.warp import transform_geom, reproject, Resampling
 from rasterio.features import geometry_mask
 from rasterio.windows import from_bounds, Window
-from rasterio.io import MemoryFile
 from pystac_client import Client
 import planetary_computer
 from fastapi import FastAPI, HTTPException, Request
@@ -188,32 +188,27 @@ def analyze(req:AnalysisRequest):
         return {"analysis":req.analysis,"metric":"water_area_km2" if req.analysis=="water" else "builtup_area_km2","earlier":{"year":req.start_year,"area_km2":round(av,4),"date":ad,"scene":aid,"cloud":acl},"later":{"year":req.end_year,"area_km2":round(bv,4),"date":bd,"scene":bid,"cloud":bcl},"change_km2":round(change,4),"change_percent":round(change/av*100,2) if av else None,"warnings":warnings,"change_legend":legend,"binary_stats":binary_stats,"change_stats":change_stats,"change_areas_km2":change_areas,"change_preview":png64(change_image),"previews":{"earlier":png64(display_rgb(ar,None,req.analysis,ai)),"later":png64(display_rgb(br,None,req.analysis,bi)),"index_earlier":render_index(ix_a,ac,ai),"index_later":render_index(ix_b,bc,bi),"binary_earlier":render_binary(am,ac,ai,req.analysis),"binary_later":render_binary(bm,bc,bi,req.analysis)},"method":("Sentinel-2 L2A tile 43QBB, 10 m for water/20 m built-up" if req.satellite=="sentinel" else "Landsat Collection 2 Level-2 30 m")+" surface reflectance; cloud/shadow/snow masked; NDWI > 0 for water; Sentinel SCL water class included; ENDISI > "+str(req.builtup_threshold)+" for built-up; pixels clipped to Powai boundary."}
     except Exception as e: raise HTTPException(502,str(e))
 
-def _read_reference_grid(content,geom):
-    with MemoryFile(content) as mem:
-        with mem.open() as src:
-            if src.count!=1: raise ValueError("Upload one single-band GeoTIFF per band prompt; multi-band stacks are not accepted here.")
-            if src.crs is None or not src.crs.is_projected: raise ValueError("The earlier Green band must use a projected CRS in metres. Reproject the input bands to UTM Zone 43N (EPSG:32643) before uploading.")
-            projected_geom=shape(transform_geom("EPSG:4326",src.crs,geom))
-            window=from_bounds(*projected_geom.bounds,transform=src.transform).round_offsets().round_lengths()
-            window=window.intersection(Window(0,0,src.width,src.height)).round_offsets().round_lengths()
-            if window.width<1 or window.height<1: raise ValueError("The earlier Green band does not cover the Powai study area.")
-            transform=src.window_transform(window); data=src.read(1,window=window).astype("float32")
-            data[src.read_masks(1,window=window)==0]=np.nan
-            factor=src.crs.axis_info[0].unit_conversion_factor or 1.0
-            pixel_km2=abs(transform.a*transform.e-transform.b*transform.d)*(factor**2)/1e6
-            return data,transform,src.crs,projected_geom,pixel_km2
+def _read_reference_grid(path,geom):
+    with rasterio.open(path) as src:
+        if src.count!=1: raise ValueError("Upload one single-band GeoTIFF per band prompt; multi-band stacks are not accepted here.")
+        if src.crs is None or not src.crs.is_projected: raise ValueError("The earlier Green band must use a projected CRS in metres. Reproject the input bands to UTM Zone 43N (EPSG:32643) before uploading.")
+        projected_geom=shape(transform_geom("EPSG:4326",src.crs,geom))
+        window=from_bounds(*projected_geom.bounds,transform=src.transform).round_offsets().round_lengths()
+        window=window.intersection(Window(0,0,src.width,src.height)).round_offsets().round_lengths()
+        if window.width<1 or window.height<1: raise ValueError("The earlier Green band does not cover the Powai study area.")
+        transform=src.window_transform(window); data=src.read(1,window=window).astype("float32")
+        data[src.read_masks(1,window=window)==0]=np.nan
+        factor=PyprojCRS.from_user_input(src.crs).axis_info[0].unit_conversion_factor or 1.0
+        pixel_km2=abs(transform.a*transform.e-transform.b*transform.d)*(factor**2)/1e6
+        return data,transform,src.crs,projected_geom,pixel_km2
 
-def _warp_uploaded_band(content,out_shape,out_transform,out_crs):
-    with MemoryFile(content) as mem:
-        with mem.open() as src:
-            if src.count!=1: raise ValueError("Upload one single-band GeoTIFF per band prompt; multi-band stacks are not accepted here.")
-            if src.crs is None: raise ValueError("An uploaded band has no coordinate reference system. Export it with its CRS attached.")
-            source=src.read(1).astype("float32")
-            source[src.read_masks(1)==0]=np.nan
-            destination=np.full(out_shape,np.nan,dtype="float32")
-            reproject(source=source,destination=destination,src_transform=src.transform,src_crs=src.crs,src_nodata=np.nan,dst_transform=out_transform,dst_crs=out_crs,dst_nodata=np.nan,resampling=Resampling.bilinear)
-            return destination
-
+def _warp_uploaded_band(path,out_shape,out_transform,out_crs):
+    with rasterio.open(path) as src:
+        if src.count!=1: raise ValueError("Upload one single-band GeoTIFF per band prompt; multi-band stacks are not accepted here.")
+        if src.crs is None: raise ValueError("An uploaded band has no coordinate reference system. Export it with its CRS attached.")
+        destination=np.full(out_shape,np.nan,dtype="float32")
+        reproject(source=rasterio.band(src,1),destination=destination,src_transform=src.transform,src_crs=src.crs,src_nodata=src.nodata,dst_transform=out_transform,dst_crs=out_crs,dst_nodata=np.nan,resampling=Resampling.bilinear)
+        return destination
 def _classify_uploaded(arrays,kind,threshold,inside):
     valid=inside.copy()
     for array in arrays.values(): valid &= np.isfinite(array)
@@ -241,6 +236,7 @@ def _classify_uploaded(arrays,kind,threshold,inside):
 
 @app.post("/api/analyze/upload")
 async def analyze_uploaded(request:Request):
+    temp_dir=tempfile.TemporaryDirectory(prefix="powai-upload-")
     try:
         form=await request.form(max_files=20,max_fields=30)
         kind=str(form.get("analysis","water")); satellite=str(form.get("satellite","sentinel"))
@@ -251,14 +247,23 @@ async def analyze_uploaded(request:Request):
         if not -1<=threshold<=1: raise ValueError("ENDISI threshold must be between -1 and 1.")
         roles=["green","nir"] if kind=="water" else ["blue","green","red","nir","swir1","swir2"]
         payloads={}; total=0
+        max_band_bytes=512*1024*1024; max_total_bytes=4*1024*1024*1024; chunk_size=8*1024*1024
         for date_key in ("earlier","later"):
             for role in roles:
                 name=f"{date_key}_{role}"; upload=form.get(name)
                 if upload is None or not hasattr(upload,"read") or not upload.filename: raise ValueError(f"Select a GeoTIFF for {date_key} {role.upper()}.")
-                data=await upload.read(); total+=len(data)
-                if len(data)>25*1024*1024: raise ValueError(f"{name} is larger than 25 MB. Clip/export the band to the Powai study area and try again.")
-                payloads[name]=data
-        if total>120*1024*1024: raise ValueError("The upload set is larger than 120 MB. Clip every band to the Powai study area before uploading.")
+                path=Path(temp_dir.name)/(name+".tif"); size=0
+                await upload.seek(0)
+                with path.open("wb") as output:
+                    while True:
+                        chunk=await upload.read(chunk_size)
+                        if not chunk: break
+                        size+=len(chunk); total+=len(chunk)
+                        if size>max_band_bytes: raise ValueError(f"{name} exceeds the 512 MB per-band limit. Clip/export it to Powai or compress the GeoTIFF, then try again.")
+                        if total>max_total_bytes: raise ValueError("The complete upload exceeds the 4 GB total limit. Clip bands to Powai and upload fewer/compressed files.")
+                        output.write(chunk)
+                if size==0: raise ValueError(f"The uploaded file for {name} is empty.")
+                payloads[name]=str(path)
         gdf=gpd.read_file(AREA)
         if gdf.crs is None: raise ValueError("The Powai boundary file has no coordinate reference system.")
         geom=gdf.to_crs(4326).geometry.union_all().__geo_interface__
@@ -294,6 +299,8 @@ async def analyze_uploaded(request:Request):
         return {"analysis":kind,"metric":"water_area_km2" if kind=="water" else "builtup_area_km2","earlier":{"year":start_year,"area_km2":earlier_area,"date":None,"scene":"User-uploaded bands","cloud":None},"later":{"year":end_year,"area_km2":later_area,"date":None,"scene":"User-uploaded bands","cloud":None},"change_km2":round(change,4),"change_percent":round(change/earlier_area*100,2) if earlier_area else None,"warnings":["Custom uploaded bands are not automatically cloud-masked. Use clear-sky, consistently processed bands."],"change_legend":"0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray nodata","binary_stats":binary_stats,"change_stats":change_stats,"change_areas_km2":change_areas,"change_preview":png64(change_image),"previews":{"earlier":scene_preview(before),"later":scene_preview(after),"index_earlier":render_index(before["index"],before["valid"],inside),"index_later":render_index(after["index"],after["valid"],inside),"binary_earlier":render_binary(before["mask"],before["valid"],inside,kind),"binary_later":render_binary(after["mask"],after["valid"],inside,kind)},"method":method}
     except Exception as e:
         raise HTTPException(400,str(e))
+    finally:
+        temp_dir.cleanup()
 
 
 
