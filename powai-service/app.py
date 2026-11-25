@@ -174,17 +174,19 @@ def analyze(req:AnalysisRequest):
         change=bv-av
         valid_both=ac&bc&ai&bi
         change_codes=np.where(valid_both,am.astype("uint8")+10*bm.astype("uint8"),255).astype("uint8")
-        change_image=np.full((*change_codes.shape,3),[220,220,220],dtype="uint8")
-        change_image[change_codes==0]=[232,236,233]
-        change_image[change_codes==1]=[235,74,86]
-        change_image[change_codes==10]=[45,150,235]
-        change_image[change_codes==11]=[45,185,115]
+        change_image=np.zeros((*change_codes.shape,4),dtype="uint8")
+        change_image[change_codes==0]=[232,236,233,255]
+        loss_color=[45,185,115,255] if req.analysis=="built" else [235,74,86,255]
+        unchanged_color=[235,74,86,255] if req.analysis=="built" else [45,185,115,255]
+        change_image[change_codes==1]=loss_color
+        change_image[change_codes==10]=[45,150,235,255]
+        change_image[change_codes==11]=unchanged_color
         binary_stats={"earlier_pct":round(float(am[ac].mean()*100),2) if ac.any() else 0.0,"later_pct":round(float(bm[bc].mean()*100),2) if bc.any() else 0.0}
         denominator=max(int(valid_both.sum()),1)
         change_stats={str(code):round(float(np.sum(change_codes[valid_both]==code)/denominator*100),2) for code in [0,1,10,11]}
         pixel_km2=(res_a*res_a)/1e6
         change_areas={"unchanged":round(float(np.sum(valid_both&(change_codes==11))*pixel_km2),4),"reduced":round(float(np.sum(valid_both&(change_codes==1))*pixel_km2),4),"increased":round(float(np.sum(valid_both&(change_codes==10))*pixel_km2),4)}
-        legend=("0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray cloud/no-data" if req.analysis=="water" else "0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray cloud/no-data")
+        legend="0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged"
         return {"analysis":req.analysis,"metric":"water_area_km2" if req.analysis=="water" else "builtup_area_km2","earlier":{"year":req.start_year,"area_km2":round(av,4),"date":ad,"scene":aid,"cloud":acl},"later":{"year":req.end_year,"area_km2":round(bv,4),"date":bd,"scene":bid,"cloud":bcl},"change_km2":round(change,4),"change_percent":round(change/av*100,2) if av else None,"warnings":warnings,"change_legend":legend,"binary_stats":binary_stats,"change_stats":change_stats,"change_areas_km2":change_areas,"change_preview":png64(change_image),"previews":{"earlier":png64(display_rgb(ar,None,req.analysis,ai)),"later":png64(display_rgb(br,None,req.analysis,bi)),"index_earlier":render_index(ix_a,ac,ai),"index_later":render_index(ix_b,bc,bi),"binary_earlier":render_binary(am,ac,ai,req.analysis),"binary_later":render_binary(bm,bc,bi,req.analysis)},"method":("Sentinel-2 L2A tile 43QBB, 10 m for water/20 m built-up" if req.satellite=="sentinel" else "Landsat Collection 2 Level-2 30 m")+" surface reflectance; cloud/shadow/snow masked; NDWI > 0 for water; Sentinel SCL water class included; ENDISI > "+str(req.builtup_threshold)+" for built-up; pixels clipped to Powai boundary."}
     except Exception as e: raise HTTPException(502,str(e))
 
@@ -284,9 +286,12 @@ async def analyze_uploaded(request:Request):
         before,after=dates
         valid_both=before["valid"]&after["valid"]&inside
         change_codes=np.where(valid_both,before["mask"].astype("uint8")+10*after["mask"].astype("uint8"),255).astype("uint8")
-        change_image=np.full((*change_codes.shape,3),[220,220,220],dtype="uint8")
-        change_image[change_codes==0]=[232,236,233]; change_image[change_codes==1]=[235,74,86]
-        change_image[change_codes==10]=[45,150,235]; change_image[change_codes==11]=[45,185,115]
+        change_image=np.zeros((*change_codes.shape,4),dtype="uint8")
+        change_image[change_codes==0]=[232,236,233,255]
+        loss_color=[45,185,115,255] if kind=="built" else [235,74,86,255]
+        unchanged_color=[235,74,86,255] if kind=="built" else [45,185,115,255]
+        change_image[change_codes==1]=loss_color
+        change_image[change_codes==10]=[45,150,235,255]; change_image[change_codes==11]=unchanged_color
         denominator=max(int(valid_both.sum()),1)
         change_stats={str(code):round(float(np.sum(change_codes[valid_both]==code)/denominator*100),2) for code in [0,1,10,11]}
         change_areas={"unchanged":round(float(np.sum(valid_both&(change_codes==11))*pixel_km2),4),"reduced":round(float(np.sum(valid_both&(change_codes==1))*pixel_km2),4),"increased":round(float(np.sum(valid_both&(change_codes==10))*pixel_km2),4)}
@@ -296,7 +301,7 @@ async def analyze_uploaded(request:Request):
             clean=np.where(np.isfinite(entry["rgb"]),entry["rgb"],np.nan)
             return png64(display_rgb(clean,None,kind,inside))
         method=f"User-uploaded {satellite.title()} single-band GeoTIFFs; {preview_note} Cloud masking is not automatic for custom bands; nodata and Powai AOI masked. All date bands resampled to the earlier Green grid."
-        return {"analysis":kind,"metric":"water_area_km2" if kind=="water" else "builtup_area_km2","earlier":{"year":start_year,"area_km2":earlier_area,"date":None,"scene":"User-uploaded bands","cloud":None},"later":{"year":end_year,"area_km2":later_area,"date":None,"scene":"User-uploaded bands","cloud":None},"change_km2":round(change,4),"change_percent":round(change/earlier_area*100,2) if earlier_area else None,"warnings":["Custom uploaded bands are not automatically cloud-masked. Use clear-sky, consistently processed bands."],"change_legend":"0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged · gray nodata","binary_stats":binary_stats,"change_stats":change_stats,"change_areas_km2":change_areas,"change_preview":png64(change_image),"previews":{"earlier":scene_preview(before),"later":scene_preview(after),"index_earlier":render_index(before["index"],before["valid"],inside),"index_later":render_index(after["index"],after["valid"],inside),"binary_earlier":render_binary(before["mask"],before["valid"],inside,kind),"binary_later":render_binary(after["mask"],after["valid"],inside,kind)},"method":method}
+        return {"analysis":kind,"metric":"water_area_km2" if kind=="water" else "builtup_area_km2","earlier":{"year":start_year,"area_km2":earlier_area,"date":None,"scene":"User-uploaded bands","cloud":None},"later":{"year":end_year,"area_km2":later_area,"date":None,"scene":"User-uploaded bands","cloud":None},"change_km2":round(change,4),"change_percent":round(change/earlier_area*100,2) if earlier_area else None,"warnings":["Custom uploaded bands are not automatically cloud-masked. Use clear-sky, consistently processed bands."],"change_legend":"0 non-target in both dates · 1 target loss · 10 target gain · 11 target unchanged","binary_stats":binary_stats,"change_stats":change_stats,"change_areas_km2":change_areas,"change_preview":png64(change_image),"previews":{"earlier":scene_preview(before),"later":scene_preview(after),"index_earlier":render_index(before["index"],before["valid"],inside),"index_later":render_index(after["index"],after["valid"],inside),"binary_earlier":render_binary(before["mask"],before["valid"],inside,kind),"binary_later":render_binary(after["mask"],after["valid"],inside,kind)},"method":method}
     except Exception as e:
         raise HTTPException(400,str(e))
     finally:
